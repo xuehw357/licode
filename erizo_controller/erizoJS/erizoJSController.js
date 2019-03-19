@@ -3,6 +3,7 @@
 
 const logger = require('./../common/logger').logger;
 const amqper = require('./../common/amqper');
+const RovReplManager = require('./../common/ROV/rovReplManager').RovReplManager;
 const Client = require('./models/Client').Client;
 const Publisher = require('./models/Publisher').Publisher;
 const ExternalInput = require('./models/Publisher').ExternalInput;
@@ -16,11 +17,43 @@ exports.ErizoJSController = (threadPool, ioThreadPool) => {
   const publishers = {};
   // {clientId: Client}
   const clients = new Map();
+  const replManager = new RovReplManager(that);
   const io = ioThreadPool;
   // {streamId: {timeout: timeout, interval: interval}}
   const statsSubscriptions = {};
   const WARN_NOT_FOUND = 404;
   const WARN_CONFLICT = 409;
+
+  const MAX_INACTIVE_UPTIME = global.config.erizo.activeUptimeLimit * 24 * 60 * 60 * 1000;
+  const MAX_TIME_SINCE_LAST_OP =
+    global.config.erizo.maxTimeSinceLastOperation * 60 * 60 * 1000;
+
+  const uptimeStats = {
+    startTime: 0,
+    lastOperation: 0,
+  };
+
+  const checkUptimeStats = () => {
+    const now = new Date();
+    const timeSinceStart = now.getTime() - uptimeStats.startTime.getTime();
+    const timeSinceLastOperation = now.getTime() - uptimeStats.lastOperation.getTime();
+    log.debug(`Checking uptime - timeSinceStart: ${timeSinceStart}, timeSinceLastOperation ${timeSinceLastOperation}, max since start ${MAX_INACTIVE_UPTIME}, max since opf ${MAX_TIME_SINCE_LAST_OP}`);
+    if (timeSinceStart > MAX_INACTIVE_UPTIME &&
+      timeSinceLastOperation > MAX_TIME_SINCE_LAST_OP) {
+      log.error(`Shutting down ErizoJS - uptime: ${timeSinceStart}, timeSinceLastOperation ${timeSinceLastOperation}`);
+      process.exit(0);
+    }
+  };
+
+  const updateUptimeInfo = () => {
+    uptimeStats.lastOperation = new Date();
+    if (uptimeStats.startTime === 0) {
+      log.info('Start checking uptime, interval', global.config.erizo.checkUptimeInterval);
+      uptimeStats.startTime = new Date();
+      setInterval(checkUptimeStats, global.config.erizo.checkUptimeInterval * 1000);
+    }
+  };
+
 
   that.publishers = publishers;
   that.ioThreadPool = io;
@@ -66,18 +99,18 @@ exports.ErizoJSController = (threadPool, ioThreadPool) => {
     callbackRpc('callback', connectionEvent);
   };
 
-  const closeNode = (node) => {
+  const closeNode = (node, sendOffer) => {
     const clientId = node.clientId;
     const connection = node.connection;
     log.debug(`message: closeNode, clientId: ${node.clientId}, streamId: ${node.streamId}`);
 
-    node.close();
+    const closePromise = node.close(sendOffer);
 
     const client = clients.get(clientId);
     if (client === undefined) {
       log.debug('message: trying to close node with no associated client,' +
         `clientId: ${clientId}, streamId: ${node.streamId}`);
-      return;
+      return Promise.resolve();
     }
 
     const remainingConnections = client.maybeCloseConnection(connection.id);
@@ -85,9 +118,15 @@ exports.ErizoJSController = (threadPool, ioThreadPool) => {
       log.debug(`message: Removing empty client from list, clientId: ${client.id}`);
       clients.delete(client.id);
     }
+    return closePromise;
+  };
+
+  that.rovMessage = (args, callback) => {
+    replManager.processRpcMessage(args, callback);
   };
 
   that.addExternalInput = (streamId, url, callbackRpc) => {
+    updateUptimeInfo();
     if (publishers[streamId] === undefined) {
       const client = getOrCreateClient(url);
       publishers[streamId] = new ExternalInput(url, streamId, threadPool);
@@ -107,6 +146,7 @@ exports.ErizoJSController = (threadPool, ioThreadPool) => {
   };
 
   that.addExternalOutput = (streamId, url, options) => {
+    updateUptimeInfo();
     if (publishers[streamId]) publishers[streamId].addExternalOutput(url, options);
   };
 
@@ -121,7 +161,23 @@ exports.ErizoJSController = (threadPool, ioThreadPool) => {
   that.processSignaling = (clientId, streamId, msg) => {
     log.info('message: Process Signaling message, ' +
       `streamId: ${streamId}, clientId: ${clientId}`);
-    if (publishers[streamId] !== undefined) {
+    if (streamId instanceof Array && streamId.length > 0) {
+      const streamIds = [];
+      let lastSubscriber;
+      streamId.forEach((sid) => {
+        const publisher = publishers[sid];
+        if (publisher.hasSubscriber(clientId)) {
+          const subscriber = publisher.getSubscriber(clientId);
+          if (subscriber) {
+            lastSubscriber = subscriber;
+            streamIds.push(subscriber.erizoStreamId);
+          }
+        }
+      });
+      if (lastSubscriber) {
+        lastSubscriber.onSignalingMessage(msg, streamIds);
+      }
+    } else if (publishers[streamId] !== undefined) {
       const publisher = publishers[streamId];
       if (publisher.hasSubscriber(clientId)) {
         const subscriber = publisher.getSubscriber(clientId);
@@ -138,6 +194,7 @@ exports.ErizoJSController = (threadPool, ioThreadPool) => {
    * of the OneToManyProcessor.
    */
   that.addPublisher = (clientId, streamId, options, callbackRpc) => {
+    updateUptimeInfo();
     let publisher;
     log.info('addPublisher, clientId', clientId, 'streamId', streamId);
     const client = getOrCreateClient(clientId, options.singlePC);
@@ -183,6 +240,7 @@ exports.ErizoJSController = (threadPool, ioThreadPool) => {
    * OneToManyProcessor.
    */
   that.addSubscriber = (clientId, streamId, options, callbackRpc) => {
+    updateUptimeInfo();
     const publisher = publishers[streamId];
     if (publisher === undefined) {
       log.warn('message: addSubscriber to unknown publisher, ' +
@@ -217,6 +275,132 @@ exports.ErizoJSController = (threadPool, ioThreadPool) => {
     if (options.singlePC && !isNewConnection) {
       callbackRpc('callback', { type: 'initializing' });
     }
+  };
+
+  /*
+   * Adds multiple subscribers to the room.
+   */
+  that.addMultipleSubscribers = (clientId, streamIds, options, callbackRpc) => {
+    if (!options.singlePC) {
+      log.warn('message: addMultipleSubscribers not compatible with no single PC, clientId:', clientId);
+    }
+
+    const knownPublishers = streamIds.map(streamId => publishers[streamId])
+                                     .filter(pub =>
+                                       pub !== undefined &&
+                                        !pub.getSubscriber(clientId));
+    if (knownPublishers.length === 0) {
+      log.warn('message: addMultipleSubscribers to unknown publisher, ' +
+        `code: ${WARN_NOT_FOUND}, streamIds: ${streamIds}, ` +
+        `clientId: ${clientId}`,
+        logger.objectToLog(options.metadata));
+      callbackRpc('callback', { type: 'error' });
+      return;
+    }
+
+    log.debug('message: addMultipleSubscribers to publishers, ' +
+        `streamIds: ${knownPublishers}, ` +
+        `clientId: ${clientId}`,
+        logger.objectToLog(options.metadata));
+
+    const client = getOrCreateClient(clientId, options.singlePC);
+    // eslint-disable-next-line no-param-reassign
+    options.publicIP = that.publicIP;
+    // eslint-disable-next-line no-param-reassign
+    options.privateRegexp = that.privateRegexp;
+    const connection = client.getOrCreateConnection(options);
+    const promises = [];
+    knownPublishers.forEach((publisher) => {
+      const streamId = publisher.streamId;
+      // eslint-disable-next-line no-param-reassign
+      options.label = publisher.label;
+      const subscriber = publisher.addSubscriber(clientId, connection, options);
+      subscriber.initMediaStream(true);
+      subscriber.copySdpInfoFromPublisher();
+      promises.push(subscriber.promise);
+      subscriber.on('callback', onAdaptSchemeNotify.bind(this, callbackRpc, 'callback'));
+      subscriber.on('periodic_stats', onPeriodicStats.bind(this, clientId, streamId));
+      subscriber.on('status_event',
+        onConnectionStatusEvent.bind(this, callbackRpc, clientId, streamId));
+    });
+
+    const knownStreamIds = knownPublishers.map(pub => pub.streamId);
+
+    const constraints = {
+      audio: true,
+      video: true,
+      bundle: true,
+    };
+
+    connection.init(knownStreamIds[0], constraints);
+    promises.push(connection.createOfferPromise);
+    Promise.all(promises)
+      .then(() => {
+        log.debug('message: autoSubscription waiting for gathering event', connection.alreadyGathered, connection.gatheredPromise);
+        return connection.gatheredPromise;
+      })
+      .then(() => {
+        callbackRpc('callback', { type: 'multiple-initializing', streamIds: knownStreamIds, context: 'auto-streams-subscription', options });
+        const evt = connection.createOffer();
+        evt.streamIds = knownStreamIds;
+        evt.options = options;
+        evt.context = 'auto-streams-subscription';
+        log.debug(`message: autoSubscription sending event, type: ${evt.type}, streamId: ${knownStreamIds}, sessionVersion: ${connection.sessionVersion}, sdp: ${evt.sdp}`);
+        callbackRpc('callback', evt);
+      });
+  };
+
+    /*
+   * Removes multiple subscribers from the room.
+   */
+  that.removeMultipleSubscribers = (clientId, streamIds, callbackRpc) => {
+    const knownPublishers = streamIds.map(streamId => publishers[streamId])
+                                     .filter(pub =>
+                                       pub !== undefined &&
+                                        pub.getSubscriber(clientId));
+    if (knownPublishers.length === 0) {
+      log.warn('message: removeMultipleSubscribers from unknown publisher, ' +
+        `code: ${WARN_NOT_FOUND}, streamIds: ${streamIds}, ` +
+        `clientId: ${clientId}`);
+      callbackRpc('callback', { type: 'error' });
+      return;
+    }
+
+    log.debug('message: removeMultipleSubscribers from publishers, ' +
+        `streamIds: ${knownPublishers}, ` +
+        `clientId: ${clientId}`);
+
+    const client = clients.get(clientId);
+    if (!client) {
+      callbackRpc('callback', { type: 'error' });
+    }
+
+    let connection;
+
+    const promises = [];
+    knownPublishers.forEach((publisher) => {
+      if (publisher && publisher.hasSubscriber(clientId)) {
+        const subscriber = publisher.getSubscriber(clientId);
+        connection = subscriber.connection;
+        promises.push(closeNode(subscriber, false));
+        publisher.removeSubscriber(clientId);
+      }
+    });
+
+    const knownStreamIds = knownPublishers.map(pub => pub.streamId);
+
+    Promise.all(promises)
+      .then(() => {
+        log.warn('message: removeMultipleSubscribers waiting for gathering event', connection.alreadyGathered, connection.gatheredPromise);
+        return connection.gatheredPromise;
+      })
+      .then(() => {
+        const evt = connection.createOffer();
+        evt.streamIds = knownStreamIds;
+        evt.context = 'auto-streams-unsubscription';
+        log.warn(`message: removeMultipleSubscribers sending event, type: ${evt.type}, streamId: ${knownStreamIds}, sessionVersion: ${connection.sessionVersion}, sdp: ${evt.sdp}`);
+        callbackRpc('callback', evt);
+      });
   };
 
   /*
@@ -266,10 +450,15 @@ exports.ErizoJSController = (threadPool, ioThreadPool) => {
       const subscriber = publisher.getSubscriber(clientId);
       log.info(`message: removing subscriber, streamId: ${subscriber.streamId}, ` +
         `clientId: ${clientId}`);
-      closeNode(subscriber);
-      publisher.removeSubscriber(clientId);
+      return closeNode(subscriber).then(() => {
+        publisher.removeSubscriber(clientId);
+        log.info(`message: subscriber node Closed, streamId: ${subscriber.streamId}`);
+        callback('callback', true);
+      });
     }
+    log.warn(`message: removeSubscriber no publisher has this subscriber, clientId: ${clientId}, streamId: ${streamId}`);
     callback('callback', true);
+    return Promise.resolve();
   };
 
   /*
